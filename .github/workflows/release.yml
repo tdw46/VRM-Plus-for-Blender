@@ -9,7 +9,7 @@ jobs:
   release:
     runs-on: ubuntu-22.04
     container:
-      image: debian:bullseye
+      image: debian:bookworm
     steps:
       - name: Install package
         run: |
