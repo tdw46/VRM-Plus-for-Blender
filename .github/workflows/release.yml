@@ -11,9 +11,9 @@ jobs:
     steps:
       - name: Install package
         run: |
-          apt-get update -qq
-          apt-get dist-upgrade -y
-          apt-get install -y advancecomp blender curl git python3 ruby shellcheck xz-utils
+          sudo apt-get update -qq
+          sudo apt-get dist-upgrade -y
+          sudo apt-get install -y advancecomp blender curl git python3 ruby shellcheck xz-utils
       - uses: actions/checkout@v3
         with:
           fetch-depth: 0
