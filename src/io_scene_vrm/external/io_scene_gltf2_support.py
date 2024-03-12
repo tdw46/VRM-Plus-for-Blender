@@ -157,6 +157,10 @@ def __invoke_export_scene_gltf(arguments: ExportSceneGltfArguments) -> set[str]:
             export_all_influences=arguments.export_all_influences,
             export_lights=arguments.export_lights,
             export_apply=arguments.export_apply,
+            export_morph_normal = False, # Reduce File Size (These don't acutally get exported properly)# Reduce File Size
+            export_colors = False, # Reduce File Size
+            use_active_collection_with_nested = False, # Reduce File Size
+            export_image_format  = "WEBP", # Reduce File Size
         )
 
     if bpy.app.version < (4,):
@@ -173,6 +177,10 @@ def __invoke_export_scene_gltf(arguments: ExportSceneGltfArguments) -> set[str]:
             export_all_influences=arguments.export_all_influences,
             export_lights=arguments.export_lights,
             export_apply=arguments.export_apply,
+            export_morph_normal = False, # Reduce File Size (These don't acutally get exported properly)# Reduce File Size
+            export_colors = False, # Reduce File Size
+            use_active_collection_with_nested = False, # Reduce File Size
+            export_image_format  = "WEBP", # Reduce File Size
         )
 
     return bpy.ops.export_scene.gltf(
@@ -189,6 +197,10 @@ def __invoke_export_scene_gltf(arguments: ExportSceneGltfArguments) -> set[str]:
         export_all_influences=arguments.export_all_influences,
         export_lights=arguments.export_lights,
         export_apply=arguments.export_apply,
+        export_morph_normal = False, # Reduce File Size (These don't acutally get exported properly)# Reduce File Size
+        export_colors = False, # Reduce File Size
+        use_active_collection_with_nested = False, # Reduce File Size
+        export_image_format  = "WEBP", # Reduce File Size
     )
 
 
