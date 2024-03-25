@@ -2,6 +2,7 @@ import datetime
 from dataclasses import dataclass
 from sys import float_info
 from typing import Optional, Union
+import time
 
 import bpy
 from bpy.app.handlers import persistent
@@ -498,3 +499,43 @@ def frame_change_pre(_dummy: object) -> None:
     state.previous_datetime = datetime.datetime.now(datetime.timezone.utc)
     delta_time = bpy.context.scene.render.fps_base / float(bpy.context.scene.render.fps)
     update_pose_bone_rotations(delta_time)
+
+@persistent
+def sixtyFPS(dummy: object) -> None:
+    state.previous_datetime = datetime.datetime.now(datetime.timezone.utc)
+    bpy.ops.wm.spring_bone_physics_operator('INVOKE_DEFAULT')
+    
+
+class SpringBonePhysicsModalOperator(bpy.types.Operator):
+    """Operator which runs itself from a timer to update spring bone physics"""
+    bl_idname = "wm.spring_bone_physics_operator"
+    bl_label = "Spring Bone Physics Operator"
+
+    _timer = None
+    _last_time = None
+
+    @persistent
+    def modal(self, context, event):
+        if event.type in {'ESC'}:
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            current_time = time.time()
+            if self._last_time is None:
+                self._last_time = current_time
+            delta_time = current_time - self._last_time
+            if delta_time >= 1 / 60:  # Update physics at 60 FPS
+                self._last_time = current_time
+                update_pose_bone_rotations(delta_time)
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        self._last_time = None
+        self._timer = context.window_manager.event_timer_add(0.0167, window=context.window) # 60 FPS
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        context.window_manager.event_timer_remove(self._timer)
