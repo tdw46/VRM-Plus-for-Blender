@@ -525,7 +525,7 @@ class SpringBonePhysicsModalOperator(bpy.types.Operator):
             if self._last_time is None:
                 self._last_time = current_time
             delta_time = current_time - self._last_time
-            if delta_time >= 1 / 60:  # Update physics at 60 FPS
+            if delta_time >= 0.0167:  # Update physics at 60 FPS
                 self._last_time = current_time
                 update_pose_bone_rotations(delta_time)
 
