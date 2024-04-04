@@ -92,10 +92,12 @@ class CapsuleWorldCollider:
 def update_pose_bone_rotations(delta_time: float) -> None:
     pose_bone_and_rotations: list[tuple[PoseBone, Quaternion]] = []
 
-    for obj in bpy.data.objects:
+    for obj in [obj for obj in bpy.data.objects if obj.type == "ARMATURE"]:
+        # print(f"Processing object: {obj.name}")
         calculate_object_pose_bone_rotations(delta_time, obj, pose_bone_and_rotations)
 
     for pose_bone, pose_bone_rotation in pose_bone_and_rotations:
+        # print(f"Updating pose bone rotation: {pose_bone.name}")
         if pose_bone.rotation_mode != "QUATERNION":
             pose_bone.rotation_mode = "QUATERNION"
 
@@ -114,15 +116,19 @@ def calculate_object_pose_bone_rotations(
     pose_bone_and_rotations: list[tuple[PoseBone, Quaternion]],
 ) -> None:
     if obj.type != "ARMATURE":
+        # print(f"Skipping non-armature object: {obj.name}")
         return
     armature_data = obj.data
     if not isinstance(armature_data, Armature):
+        # print(f"Invalid armature data for object: {obj.name}")
         return
     ext = armature_data.vrm_addon_extension
     if not ext.is_vrm1():
+        # print(f"Skipping non-VRM1 armature: {obj.name}")
         return
     spring_bone1 = ext.spring_bone1
     if not spring_bone1.enable_animation:
+        # print(f"Spring bone animation disabled for armature: {obj.name}")
         return
 
     collider_uuid_to_world_collider: dict[
@@ -131,6 +137,7 @@ def calculate_object_pose_bone_rotations(
     for collider in spring_bone1.colliders:
         pose_bone = obj.pose.bones.get(collider.node.bone_name)
         if not pose_bone:
+            # print(f"Collider pose bone not found: {collider.node.bone_name}")
             continue
         pose_bone_world_matrix = obj.matrix_world @ pose_bone.matrix
 
@@ -163,6 +170,7 @@ def calculate_object_pose_bone_rotations(
                 collider_reference.collider_uuid
             )
             if world_collider is None:
+                # print(f"Collider reference not found: {collider_reference.collider_uuid}")
                 continue
             world_colliders = collider_group_uuid_to_world_colliders.get(
                 collider_group.uuid
@@ -175,12 +183,15 @@ def calculate_object_pose_bone_rotations(
             world_colliders.append(world_collider)
 
     for spring in spring_bone1.springs:
+        # print(f"Processing spring: {spring.name}")
         joints = spring.joints
         if not joints:
+            # print("No joints found for spring")
             continue
         first_joint = joints[0]
         first_pose_bone = obj.pose.bones.get(first_joint.node.bone_name)
         if not first_pose_bone:
+            # print(f"First joint pose bone not found: {first_joint.node.bone_name}")
             continue
 
         center_pose_bone = obj.pose.bones.get(spring.center.bone_name)
@@ -194,6 +205,7 @@ def calculate_object_pose_bone_rotations(
                 break
             ancestor_of_first_pose_bone = ancestor_of_first_pose_bone.parent
         if not center_pose_bone_is_ancestor_of_first_pose_bone:
+            # print("Center pose bone is not an ancestor of the first joint pose bone")
             center_pose_bone = None
 
         if center_pose_bone:
@@ -263,6 +275,7 @@ def calculate_spring_pose_bone_rotations(
         bone_name = joint.node.bone_name
         pose_bone = obj.pose.bones.get(bone_name)
         if not pose_bone:
+            # print(f"Pose bone not found for joint: {bone_name}")
             continue
         rest_object_matrix = pose_bone.bone.convert_local_to_pose(
             Matrix(), pose_bone.bone.matrix_local
@@ -274,15 +287,16 @@ def calculate_spring_pose_bone_rotations(
         tail_pose_bone,
         tail_rest_object_matrix,
     ) in zip(joints, joints[1:]):
-        head_tail_parented = False
-        searching_tail_parent = tail_pose_bone.parent
-        while searching_tail_parent:
-            if searching_tail_parent.name == head_pose_bone.name:
-                head_tail_parented = True
-                break
-            searching_tail_parent = searching_tail_parent.parent
-        if not head_tail_parented:
-            return
+        # head_tail_parented = False
+        # searching_tail_parent = tail_pose_bone.parent
+        # while searching_tail_parent:
+        #     if searching_tail_parent.name == head_pose_bone.name:
+        #         head_tail_parented = True
+        #         break
+        #     searching_tail_parent = searching_tail_parent.parent
+        # if not head_tail_parented:
+        #     # print("Head and tail joints are not parented correctly")
+        #     return
 
         inputs.append(
             (
@@ -301,6 +315,7 @@ def calculate_spring_pose_bone_rotations(
             collider_group_reference.collider_group_uuid
         )
         if not collider_group_world_colliders:
+            # print(f"Collider group not found: {collider_group_reference.collider_group_uuid}")
             continue
         world_colliders.extend(collider_group_world_colliders)
 
@@ -389,38 +404,33 @@ def calculate_joint_pair_head_pose_bone_rotations(
         + previous_to_current_center_world_translation
     )
 
-    inertia = (current_tail_world_translation - previous_tail_world_translation) * (
-        1.0 - head_joint.drag_force
-    )
-
-    next_head_rotation_start_target_local_translation = (
+    inertia = (current_tail_world_translation - previous_tail_world_translation) * (1.0 - head_joint.drag_force)
+    stiffness_direction = (
         current_head_rest_object_matrix.inverted_safe()
         @ current_tail_rest_object_matrix.to_translation()
     )
-    stiffness_direction = (
+    stiffness = (
         obj.matrix_world.to_quaternion()
         @ next_head_pose_bone_before_rotation_matrix.to_quaternion()
-        @ next_head_rotation_start_target_local_translation
-    ).normalized()
-    stiffness = stiffness_direction * delta_time * head_joint.stiffness
-    external = Vector(head_joint.gravity_dir) * delta_time * head_joint.gravity_power
+        @ stiffness_direction
+    ).normalized() * head_joint.stiffness * delta_time
+    external = Vector(head_joint.gravity_dir) * head_joint.gravity_power * delta_time
 
-    next_tail_world_translation = (
-        current_tail_world_translation + inertia + stiffness + external
-    )
+    next_tail_world_translation = current_tail_world_translation + inertia + stiffness + external
 
     head_to_tail_world_distance = (
         obj.matrix_world @ current_head_pose_bone_matrix.to_translation()
         - (obj.matrix_world @ current_tail_pose_bone_matrix.to_translation())
     ).length
 
-    # 次のTailに距離の制約を適用
+    # Apply distance constraint to the next tail position
     next_tail_world_translation = (
         next_head_world_translation
         + (next_tail_world_translation - next_head_world_translation).normalized()
         * head_to_tail_world_distance
     )
-    # コライダーの衝突を計算
+
+    # Calculate collisions
     for world_collider in world_colliders:
         direction, distance = world_collider.calculate_collision(
             next_tail_world_translation,
@@ -428,23 +438,24 @@ def calculate_joint_pair_head_pose_bone_rotations(
         )
         if distance >= 0:
             continue
-        # 押しのける
+        # Push out the next tail position
         next_tail_world_translation = next_tail_world_translation - direction * distance
-        # 次のTailに距離の制約を適用
+        # Apply distance constraint to the next tail position
         next_tail_world_translation = (
             next_head_world_translation
             + (next_tail_world_translation - next_head_world_translation).normalized()
             * head_to_tail_world_distance
         )
 
-    next_tail_object_local_translation = (
-        obj.matrix_world.inverted_safe() @ next_tail_world_translation
+    # Calculate rotation
+    next_head_rotation_start_target_local_translation = (
+        current_head_rest_object_matrix.inverted_safe()
+        @ current_tail_rest_object_matrix.to_translation()
     )
     next_head_rotation_end_target_local_translation = (
         next_head_pose_bone_before_rotation_matrix.inverted_safe()
-        @ next_tail_object_local_translation
+        @ (obj.matrix_world.inverted_safe() @ next_tail_world_translation)
     )
-
     next_head_pose_bone_rotation = Quaternion(
         next_head_rotation_start_target_local_translation.cross(
             next_head_rotation_end_target_local_translation
