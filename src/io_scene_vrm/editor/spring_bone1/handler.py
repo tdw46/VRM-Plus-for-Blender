@@ -251,7 +251,7 @@ def calculate_spring_pose_bone_rotations(
     collider_group_uuid_to_world_colliders: dict[
         str, list[Union[SphereWorldCollider, CapsuleWorldCollider]]
     ],
-    center_pose_bone: Optional[Union[PoseBone, Vector]],
+    previous_to_current_center_world_translation: Optional[Vector],
 ) -> None:
     inputs: list[
         tuple[
@@ -275,7 +275,6 @@ def calculate_spring_pose_bone_rotations(
         bone_name = joint.node.bone_name
         pose_bone = obj.pose.bones.get(bone_name)
         if not pose_bone:
-            # print(f"Pose bone not found for joint: {bone_name}")
             continue
         rest_object_matrix = pose_bone.bone.convert_local_to_pose(
             Matrix(), pose_bone.bone.matrix_local
@@ -287,17 +286,6 @@ def calculate_spring_pose_bone_rotations(
         tail_pose_bone,
         tail_rest_object_matrix,
     ) in zip(joints, joints[1:]):
-        # head_tail_parented = False
-        # searching_tail_parent = tail_pose_bone.parent
-        # while searching_tail_parent:
-        #     if searching_tail_parent.name == head_pose_bone.name:
-        #         head_tail_parented = True
-        #         break
-        #     searching_tail_parent = searching_tail_parent.parent
-        # if not head_tail_parented:
-        #     # print("Head and tail joints are not parented correctly")
-        #     return
-
         inputs.append(
             (
                 head_joint,
@@ -315,27 +303,13 @@ def calculate_spring_pose_bone_rotations(
             collider_group_reference.collider_group_uuid
         )
         if not collider_group_world_colliders:
-            # print(f"Collider group not found: {collider_group_reference.collider_group_uuid}")
             continue
         world_colliders.extend(collider_group_world_colliders)
 
-    previous_to_current_center_world_translation = Vector((0, 0, 0))
+    center_pose_bone = obj.pose.bones.get(spring.center.bone_name)
+    center_world_matrix = None
     if center_pose_bone:
-        if isinstance(center_pose_bone, PoseBone):
-            current_center_world_translation = (
-                obj.matrix_world @ center_pose_bone.matrix
-            ).to_translation()
-        else:
-            current_center_world_translation = center_pose_bone.copy()
-        previous_center_world_translation = Vector(
-            spring.animation_state.previous_center_world_translation
-        )
-        previous_to_current_center_world_translation = (
-            current_center_world_translation - previous_center_world_translation
-        )
-        spring.animation_state.previous_center_world_translation = (
-            current_center_world_translation.copy()
-        )
+        center_world_matrix = obj.matrix_world @ center_pose_bone.matrix
 
     next_head_pose_bone_before_rotation_matrix = None
     for (
@@ -369,6 +343,7 @@ def calculate_spring_pose_bone_rotations(
             tail_rest_object_matrix,
             next_head_pose_bone_before_rotation_matrix,
             world_colliders,
+            center_world_matrix if is_center_pose_bone_ancestor else None,
             previous_to_current_center_world_translation if is_center_pose_bone_ancestor else None,
         )
         pose_bone_and_rotations.append((head_pose_bone, head_pose_bone_rotation))
@@ -385,6 +360,7 @@ def calculate_joint_pair_head_pose_bone_rotations(
     current_tail_rest_object_matrix: Matrix,
     next_head_pose_bone_before_rotation_matrix: Optional[Matrix],
     world_colliders: list[Union[SphereWorldCollider, CapsuleWorldCollider]],
+    center_world_matrix: Optional[Matrix],
     previous_to_current_center_world_translation: Optional[Vector],
 ) -> tuple[Quaternion, Matrix]:
     current_head_pose_bone_matrix = head_pose_bone.matrix
@@ -401,12 +377,22 @@ def calculate_joint_pair_head_pose_bone_rotations(
 
     next_head_world_translation = (obj.matrix_world @ next_head_pose_bone_before_rotation_matrix.to_translation())
 
+    if not tail_joint.animation_state.initialized_as_tail:
+        initial_tail_world_translation = (obj.matrix_world @ current_tail_pose_bone_matrix).to_translation()
+        tail_joint.animation_state.initialized_as_tail = True
+        tail_joint.animation_state.previous_world_translation = initial_tail_world_translation
+        tail_joint.animation_state.current_world_translation = initial_tail_world_translation
+
     previous_tail_world_translation = Vector(tail_joint.animation_state.previous_world_translation)
     current_tail_world_translation = Vector(tail_joint.animation_state.current_world_translation)
 
-    if previous_to_current_center_world_translation is not None:
-        previous_tail_world_translation += previous_to_current_center_world_translation
-        current_tail_world_translation += previous_to_current_center_world_translation
+    if center_world_matrix is not None:
+        if previous_to_current_center_world_translation is not None:
+            previous_tail_world_translation += previous_to_current_center_world_translation
+            current_tail_world_translation += previous_to_current_center_world_translation
+        else:
+            previous_tail_world_translation = center_world_matrix.inverted_safe() @ previous_tail_world_translation
+            current_tail_world_translation = center_world_matrix.inverted_safe() @ current_tail_world_translation
 
     inertia = (current_tail_world_translation - previous_tail_world_translation) * (1.0 - head_joint.drag_force)
 
@@ -441,8 +427,12 @@ def calculate_joint_pair_head_pose_bone_rotations(
 
     next_tail_pose_bone_before_rotation_matrix = next_head_pose_bone_matrix @ current_head_rest_object_matrix.inverted_safe() @ current_tail_rest_object_matrix
 
-    tail_joint.animation_state.previous_world_translation = list(current_tail_world_translation)
-    tail_joint.animation_state.current_world_translation = list(next_tail_world_translation)
+    if center_world_matrix is not None:
+        tail_joint.animation_state.previous_world_translation = center_world_matrix @ current_tail_world_translation
+        tail_joint.animation_state.current_world_translation = center_world_matrix @ next_tail_world_translation
+    else:
+        tail_joint.animation_state.previous_world_translation = current_tail_world_translation
+        tail_joint.animation_state.current_world_translation = next_tail_world_translation
 
     return (
         next_head_pose_bone_rotation if head_pose_bone.bone.use_inherit_rotation else next_head_pose_bone_object_rotation,
