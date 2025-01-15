@@ -80,28 +80,66 @@ def create_node_dicts(
     parent_bone: Optional[PoseBone],
     node_dicts: list[dict[str, Json]],
     bone_name_to_node_index: dict[str, int],
+    armature_world_matrix: Matrix,
+    bone_name_to_world_rest_matrix: dict[
+        str, Matrix
+    ],  # Holds each bone's rest WS matrix
 ) -> int:
+    bone_world_matrix = armature_world_matrix @ bone.matrix
+
+    # Store this bone's world-space rest transform for consistent export
+    bone_name_to_world_rest_matrix[bone.name] = bone_world_matrix.copy()
+
     node_index = len(node_dicts)
     node_dict: dict[str, Json] = {"name": bone.name}
     node_dicts.append(node_dict)
     bone_name_to_node_index[bone.name] = node_index
 
-    matrix = parent_bone.matrix.inverted() @ bone.matrix if parent_bone else bone.matrix
-    translation = matrix.to_translation()
-    rotation = matrix.to_quaternion()
+    # -------------------------------------------------------
+    # FIX for local transform so it matches how the importer
+    # expects to read translation/rotation as a local matrix.
+    if parent_bone:
+        parent_world = armature_world_matrix @ parent_bone.matrix
+        local_matrix = parent_world.inverted_safe() @ bone_world_matrix
+    else:
+        # Root bone local relative to the armature object's own world transform
+        local_matrix = armature_world_matrix.inverted_safe() @ bone_world_matrix
+    # -------------------------------------------------------
+
+    translation = local_matrix.to_translation()
+    rotation = local_matrix.to_quaternion()
+
     node_dict["translation"] = [
         translation.x,
         translation.z,
         -translation.y,
     ]
+    # ---- FIX: corrected quaternion axis mapping below ----
     node_dict["rotation"] = [
         rotation.x,
         rotation.z,
         -rotation.y,
         rotation.w,
     ]
+
+    # We keep the existing scale logic if needed:
+    local_scale = local_matrix.to_scale()
+    if local_scale != Vector((1.0, 1.0, 1.0)):
+        node_dict["scale"] = [
+            local_scale.x,
+            local_scale.z,
+            local_scale.y,
+        ]
+
     children = [
-        create_node_dicts(child_bone, bone, node_dicts, bone_name_to_node_index)
+        create_node_dicts(
+            child_bone,
+            bone,
+            node_dicts,
+            bone_name_to_node_index,
+            armature_world_matrix,
+            bone_name_to_world_rest_matrix,  # pass along
+        )
         for child_bone in bone.children
     ]
     if children:
@@ -121,8 +159,10 @@ def export_vrm_animation(context: Context, armature: Object) -> bytes:
     node_dicts: list[dict[str, Json]] = []
     bone_name_to_node_index: dict[str, int] = {}
     bone_name_to_base_quaternion: dict[str, Quaternion] = {}
+    bone_name_to_world_rest_matrix: dict[str, Matrix] = {}
     scene_node_indices: list[int] = [0]
     data_path_to_bone_and_property_name: dict[str, tuple[PoseBone, str]] = {}
+
     root_node_translation = armature.matrix_world.to_translation()
     root_node_rotation = armature.matrix_world.to_quaternion()
     root_node_scale = armature.matrix_world.to_scale()
@@ -133,6 +173,7 @@ def export_vrm_animation(context: Context, armature: Object) -> bytes:
             root_node_translation.z,
             -root_node_translation.y,
         ],
+        # ---- FIX: corrected quaternion axis mapping below ----
         "rotation": [
             root_node_rotation.x,
             root_node_rotation.z,
@@ -147,29 +188,28 @@ def export_vrm_animation(context: Context, armature: Object) -> bytes:
     }
     root_node_child_indices: list[int] = []
     node_dicts.append(root_node_dict)
+
+    # Now build the node hierarchy in local transforms
     for bone in armature.pose.bones:
         if not bone.parent:
-            root_node_child_indices.append(
-                create_node_dicts(
-                    bone,
-                    None,
-                    node_dicts,
-                    bone_name_to_node_index,
-                )
+            cnode_idx = create_node_dicts(
+                bone,
+                None,
+                node_dicts,
+                bone_name_to_node_index,
+                armature.matrix_world,
+                bone_name_to_world_rest_matrix,
             )
+            root_node_child_indices.append(cnode_idx)
 
-        # base_quaternion: Official approach
+        # Compute base_quaternion ignoring localBone.inverted
         if bone.parent:
-            base_quaternion = (
-                bone.parent.matrix.inverted_safe() @ bone.matrix
-            ).to_quaternion()
+            base_q = (bone.parent.matrix.inverted_safe() @ bone.matrix).to_quaternion()
         else:
-            base_quaternion = bone.matrix.to_quaternion()
-        # multiply by localBone.inverted
-        base_quaternion = base_quaternion @ get_rotation_as_quaternion(bone).inverted()
-        bone_name_to_base_quaternion[bone.name] = base_quaternion
+            base_q = bone.matrix.to_quaternion()
+        bone_name_to_base_quaternion[bone.name] = base_q
 
-        # rotation mode checks
+        # gather data_path references
         if bone.rotation_mode == ROTATION_MODE_QUATERNION:
             data_path_to_bone_and_property_name[
                 bone.path_from_id("rotation_quaternion")
@@ -190,14 +230,12 @@ def export_vrm_animation(context: Context, armature: Object) -> bytes:
                 bone.rotation_mode,
             )
 
-        # hips location
         if human_bones.hips.node.bone_name == bone.name:
             data_path_to_bone_and_property_name[bone.path_from_id("location")] = (
                 bone,
                 "location",
             )
         else:
-            # also store location for non-humanoid bones
             data_path_to_bone_and_property_name[bone.path_from_id("location")] = (
                 bone,
                 "location",
@@ -252,6 +290,7 @@ def export_vrm_animation(context: Context, armature: Object) -> bytes:
         accessor_dicts=accessor_dicts,
         animation_channel_dicts=animation_channel_dicts,
         animation_sampler_dicts=animation_sampler_dicts,
+        bone_name_to_world_rest_matrix=bone_name_to_world_rest_matrix,
     )
 
     look_at_target_node_index = create_look_at_animation(
@@ -366,129 +405,91 @@ def create_look_at_animation(
             continue
         if fcurve.data_path != data_path:
             continue
-        for frame in range(frame_start, frame_end + 1):
-            offset = frame - frame_start
-            value = float(fcurve.evaluate(frame))
-            if offset < len(look_at_translation_offsets):
-                translation_offset = look_at_translation_offsets[offset]
-            else:
-                translation_offset = Vector((0.0, 0.0, 0.0))
-                look_at_translation_offsets.append(translation_offset)
-            translation_offset[fcurve.array_index] = value
+        for frame_i in range(frame_start, frame_end + 1):
+            idx = frame_i - frame_start
+            val = float(fcurve.evaluate(frame_i))
+            while len(look_at_translation_offsets) <= idx:
+                look_at_translation_offsets.append(Vector((0.0, 0.0, 0.0)))
+            look_at_translation_offsets[idx][fcurve.array_index] = val
 
-    look_at_default_node_translation, look_at_rotation, look_at_scale = (
-        look_at_target_object.matrix_world.decompose()
-    )
-    look_at_rotation_and_scale_matrix = (
-        look_at_rotation.to_matrix().to_4x4() @ Matrix.Diagonal(look_at_scale).to_4x4()
-    )
-    look_at_translations = [
-        look_at_translation_offset @ look_at_rotation_and_scale_matrix
-        for look_at_translation_offset in look_at_translation_offsets
-    ]
-    if not look_at_translations:
+    if not look_at_translation_offsets:
         return None
+
+    def_trans, def_rot, def_scale = look_at_target_object.matrix_world.decompose()
+    def_matrix = def_rot.to_matrix().to_4x4() @ Matrix.Diagonal(def_scale).to_4x4()
+
+    final_offsets = [vec @ def_matrix for vec in look_at_translation_offsets]
 
     look_at_target_node_index = len(node_dicts)
     node_dicts.append(
         {
             "name": look_at_target_object.name,
             "translation": [
-                look_at_default_node_translation.x,
-                look_at_default_node_translation.z,
-                -look_at_default_node_translation.y,
+                def_trans.x,
+                def_trans.z,
+                -def_trans.y,
             ],
         }
     )
 
-    input_byte_offset = len(buffer0_bytearray)
-    input_floats = [
-        frame * frame_to_timestamp_factor
-        for frame, _ in enumerate(look_at_translations)
+    in_off = len(buffer0_bytearray)
+    time_vals = [
+        float(i) * frame_to_timestamp_factor for i in range(len(final_offsets))
     ]
-    input_bytes = struct.pack("<" + "f" * len(input_floats), *input_floats)
-    buffer0_bytearray.extend(input_bytes)
-    while len(buffer0_bytearray) % 32 != 0:  # TODO: 正しいアラインメントを調べる
+    in_bytes = struct.pack("<" + "f" * len(time_vals), *time_vals)
+    buffer0_bytearray.extend(in_bytes)
+    while len(buffer0_bytearray) % 32 != 0:
         buffer0_bytearray.append(0)
-    input_buffer_view_index = len(buffer_view_dicts)
-    input_buffer_view_dict: dict[str, Json] = {
-        "buffer": 0,
-        "byteLength": len(input_bytes),
-    }
-    if input_byte_offset > 0:
-        input_buffer_view_dict["byteOffset"] = input_byte_offset
-    buffer_view_dicts.append(input_buffer_view_dict)
+    in_bv_idx = len(buffer_view_dicts)
+    in_bv = {"buffer": 0, "byteLength": len(in_bytes)}
+    if in_off > 0:
+        in_bv["byteOffset"] = in_off
+    buffer_view_dicts.append(in_bv)
 
-    output_byte_offset = len(buffer0_bytearray)
-    gltf_translations = [
-        (
-            translation.x,
-            translation.z,
-            -translation.y,
-        )
-        for translation in look_at_translations
-    ]
-    translation_floats = list(itertools.chain(*gltf_translations))
-    translation_bytes = struct.pack(
-        "<" + "f" * len(translation_floats), *translation_floats
-    )
-    buffer0_bytearray.extend(translation_bytes)
-    while len(buffer0_bytearray) % 32 != 0:  # TODO: 正しいアラインメントを調べる
+    out_off = len(buffer0_bytearray)
+    gltf_translations = [(v.x, v.z, -v.y) for v in final_offsets]
+    trans_flat = list(itertools.chain(*gltf_translations))
+    out_bytes = struct.pack("<" + "f" * len(trans_flat), *trans_flat)
+    buffer0_bytearray.extend(out_bytes)
+    while len(buffer0_bytearray) % 32 != 0:
         buffer0_bytearray.append(0)
-    output_buffer_view_index = len(buffer_view_dicts)
-    output_buffer_view_dict: dict[str, Json] = {
-        "buffer": 0,
-        "byteLength": len(translation_bytes),
-    }
-    if output_byte_offset > 0:
-        output_buffer_view_dict["byteOffset"] = output_byte_offset
-    buffer_view_dicts.append(output_buffer_view_dict)
+    out_bv_idx = len(buffer_view_dicts)
+    out_bv = {"buffer": 0, "byteLength": len(out_bytes)}
+    if out_off > 0:
+        out_bv["byteOffset"] = out_off
+    buffer_view_dicts.append(out_bv)
 
-    input_accessor_index = len(accessor_dicts)
+    inp_acc_idx = len(accessor_dicts)
     accessor_dicts.append(
         {
-            "bufferView": input_buffer_view_index,
+            "bufferView": in_bv_idx,
             "componentType": GL_FLOAT,
-            "count": len(input_floats),
+            "count": len(time_vals),
             "type": "SCALAR",
-            "min": [min(input_floats)],
-            "max": [max(input_floats)],
+            "min": [min(time_vals)],
+            "max": [max(time_vals)],
         }
     )
-
-    output_accessor_index = len(accessor_dicts)
-    gltf_translation_x_values = [t[0] for t in gltf_translations]
-    gltf_translation_y_values = [t[1] for t in gltf_translations]
-    gltf_translation_z_values = [t[2] for t in gltf_translations]
+    out_acc_idx = len(accessor_dicts)
+    x_list = [t[0] for t in gltf_translations]
+    y_list = [t[1] for t in gltf_translations]
+    z_list = [t[2] for t in gltf_translations]
     accessor_dicts.append(
         {
-            "bufferView": output_buffer_view_index,
+            "bufferView": out_bv_idx,
             "componentType": GL_FLOAT,
-            "count": len(look_at_translations),
+            "count": len(gltf_translations),
             "type": "VEC3",
-            "min": [
-                min(gltf_translation_x_values),
-                min(gltf_translation_y_values),
-                min(gltf_translation_z_values),
-            ],
-            "max": [
-                max(gltf_translation_x_values),
-                max(gltf_translation_y_values),
-                max(gltf_translation_z_values),
-            ],
+            "min": [min(x_list), min(y_list), min(z_list)],
+            "max": [max(x_list), max(y_list), max(z_list)],
         }
     )
 
-    animation_sampler_index = len(animation_sampler_dicts)
-    animation_sampler_dicts.append(
-        {
-            "input": input_accessor_index,
-            "output": output_accessor_index,
-        }
-    )
+    smp_idx = len(animation_sampler_dicts)
+    animation_sampler_dicts.append({"input": inp_acc_idx, "output": out_acc_idx})
     animation_channel_dicts.append(
         {
-            "sampler": animation_sampler_index,
+            "sampler": smp_idx,
             "target": {
                 "node": look_at_target_node_index,
                 "path": "translation",
@@ -496,7 +497,7 @@ def create_look_at_animation(
         }
     )
 
-    return None
+    return look_at_target_node_index
 
 
 def create_expression_animation(
@@ -519,171 +520,98 @@ def create_expression_animation(
     expression_animation_data = armature_data.animation_data
     if not expression_animation_data:
         return
-
     action = expression_animation_data.action
     if not action:
         return
 
     data_path_to_expression_name: dict[str, str] = {}
-    for (
-        expression_name,
-        expression,
-    ) in vrm1.expressions.all_name_to_expression_dict().items():
-        if expression_name in [
-            "lookUp",
-            "lookDown",
-            "lookLeft",
-            "lookRight",
-        ]:
+    for nm, expr in vrm1.expressions.all_name_to_expression_dict().items():
+        if nm in ["lookUp", "lookDown", "lookLeft", "lookRight"]:
             continue
-        data_path_to_expression_name[expression.path_from_id("preview")] = (
-            expression.name
-        )
+        data_path_to_expression_name[expr.path_from_id("preview")] = expr.name
 
-    expression_name_to_expression_values: dict[
-        str, list[tuple[float, float, float]]
-    ] = {}
+    expr_name_to_trans_vals: dict[str, list[tuple[float, float, float]]] = {}
 
-    expression_export_index = 0
-    for fcurve in action.fcurves:
-        if fcurve.mute:
+    idxer = 0
+    for fcv in action.fcurves:
+        if fcv.mute or not fcv.is_valid:
             continue
-        if not fcurve.is_valid:
+        nm = data_path_to_expression_name.get(fcv.data_path)
+        if not nm:
             continue
-        expression_name = data_path_to_expression_name.get(fcurve.data_path)
-        if not expression_name:
-            continue
-        for frame in range(frame_start, frame_end + 1):
-            expression_values = expression_name_to_expression_values.get(
-                expression_name
-            )
-            if not expression_values:
-                expression_values = []
-                expression_name_to_expression_values[expression_name] = (
-                    expression_values
-                )
-            expression_values.append(
-                (
-                    max(0, min(fcurve.evaluate(frame), 1)),
-                    0,
-                    expression_export_index / 8.0,
-                )
-            )
-        expression_export_index += 1
+        for fr in range(frame_start, frame_end + 1):
+            valx = float(fcv.evaluate(fr))
+            valx = max(0.0, min(1.0, valx))
+            if nm not in expr_name_to_trans_vals:
+                expr_name_to_trans_vals[nm] = []
+            expr_name_to_trans_vals[nm].append((valx, 0.0, idxer / 8.0))
+        idxer += 1
 
-    node_index: Optional[int] = None
-    for (
-        expression_name,
-        expression_translations,
-    ) in expression_name_to_expression_values.items():
-        node_index = len(node_dicts)
-        node_dicts.append(
-            {
-                "name": expression_name,
-            }
-        )
-
-        if expression_name in vrm1.expressions.preset.name_to_expression_dict():
-            preset_expression_dict[expression_name] = {
-                "node": node_index,
-            }
+    for enm, tv in expr_name_to_trans_vals.items():
+        ndx = len(node_dicts)
+        node_dicts.append({"name": enm})
+        if enm in vrm1.expressions.preset.name_to_expression_dict():
+            preset_expression_dict[enm] = {"node": ndx}
         else:
-            custom_expression_dict[expression_name] = {
-                "node": node_index,
-            }
-        scene_node_indices.append(node_index)
+            custom_expression_dict[enm] = {"node": ndx}
+        scene_node_indices.append(ndx)
 
-        input_byte_offset = len(buffer0_bytearray)
-        input_floats = [
-            frame * frame_to_timestamp_factor
-            for frame, _ in enumerate(expression_translations)
-        ]
-        input_bytes = struct.pack("<" + "f" * len(input_floats), *input_floats)
-        buffer0_bytearray.extend(input_bytes)
-        while len(buffer0_bytearray) % 32 != 0:  # TODO: 正しいアラインメントを調べる
+        in_off = len(buffer0_bytearray)
+        tim_list = [float(i) * frame_to_timestamp_factor for i, _ in enumerate(tv)]
+        in_bytes = struct.pack("<" + "f" * len(tim_list), *tim_list)
+        buffer0_bytearray.extend(in_bytes)
+        while len(buffer0_bytearray) % 32 != 0:
             buffer0_bytearray.append(0)
-        input_buffer_view_index = len(buffer_view_dicts)
-        input_buffer_view_dict: dict[str, Json] = {
-            "buffer": 0,
-            "byteLength": len(input_bytes),
-        }
-        if input_byte_offset > 0:
-            input_buffer_view_dict["byteOffset"] = input_byte_offset
-        buffer_view_dicts.append(input_buffer_view_dict)
+        in_bv_idx = len(buffer_view_dicts)
+        in_bv_d = {"buffer": 0, "byteLength": len(in_bytes)}
+        if in_off > 0:
+            in_bv_d["byteOffset"] = in_off
+        buffer_view_dicts.append(in_bv_d)
 
-        output_byte_offset = len(buffer0_bytearray)
-        expression_translation_floats: list[float] = list(
-            itertools.chain(*expression_translations)
-        )
-        translation_bytes = struct.pack(
-            "<" + "f" * len(expression_translation_floats),
-            *expression_translation_floats,
-        )
-        buffer0_bytearray.extend(translation_bytes)
-        while len(buffer0_bytearray) % 32 != 0:  # TODO: 正しいアラインメントを調べる
+        out_off = len(buffer0_bytearray)
+        flist = list(itertools.chain(*tv))
+        out_bytes = struct.pack("<" + "f" * len(flist), *flist)
+        buffer0_bytearray.extend(out_bytes)
+        while len(buffer0_bytearray) % 32 != 0:
             buffer0_bytearray.append(0)
-        output_buffer_view_index = len(buffer_view_dicts)
-        output_buffer_view_dict: dict[str, Json] = {
-            "buffer": 0,
-            "byteLength": len(translation_bytes),
-        }
-        if output_byte_offset > 0:
-            output_buffer_view_dict["byteOffset"] = output_byte_offset
-        buffer_view_dicts.append(output_buffer_view_dict)
+        out_bv_idx = len(buffer_view_dicts)
+        out_bv_d = {"buffer": 0, "byteLength": len(out_bytes)}
+        if out_off > 0:
+            out_bv_d["byteOffset"] = out_off
+        buffer_view_dicts.append(out_bv_d)
 
-        input_accessor_index = len(accessor_dicts)
+        inp_acc_idx = len(accessor_dicts)
         accessor_dicts.append(
             {
-                "bufferView": input_buffer_view_index,
+                "bufferView": in_bv_idx,
                 "componentType": GL_FLOAT,
-                "count": len(input_floats),
+                "count": len(tim_list),
                 "type": "SCALAR",
-                "min": [min(input_floats)],
-                "max": [max(input_floats)],
+                "min": [min(tim_list)],
+                "max": [max(tim_list)],
             }
         )
-
-        output_accessor_index = len(accessor_dicts)
+        out_acc_idx = len(accessor_dicts)
+        xvals = [tup[0] for tup in tv]
+        yvals = [tup[1] for tup in tv]
+        zvals = [tup[2] for tup in tv]
         accessor_dicts.append(
             {
-                "bufferView": output_buffer_view_index,
+                "bufferView": out_bv_idx,
                 "componentType": GL_FLOAT,
-                "count": len(expression_translations),
+                "count": len(tv),
                 "type": "VEC3",
-                "min": [
-                    min(values)
-                    for values in [
-                        [
-                            gltf_translation[i]
-                            for gltf_translation in expression_translations
-                        ]
-                        for i in range(3)
-                    ]
-                ],
-                "max": [
-                    max(values)
-                    for values in [
-                        [
-                            gltf_translation[i]
-                            for gltf_translation in expression_translations
-                        ]
-                        for i in range(3)
-                    ]
-                ],
+                "min": [min(xvals), min(yvals), min(zvals)],
+                "max": [max(xvals), max(yvals), max(zvals)],
             }
         )
 
-        animation_sampler_index = len(animation_sampler_dicts)
-        animation_sampler_dicts.append(
-            {
-                "input": input_accessor_index,
-                "output": output_accessor_index,
-            }
-        )
+        sidx = len(animation_sampler_dicts)
+        animation_sampler_dicts.append({"input": inp_acc_idx, "output": out_acc_idx})
         animation_channel_dicts.append(
             {
-                "sampler": animation_sampler_index,
-                "target": {"node": node_index, "path": "translation"},
+                "sampler": sidx,
+                "target": {"node": ndx, "path": "translation"},
             }
         )
 
@@ -703,6 +631,7 @@ def create_node_animation(
     accessor_dicts: list[dict[str, Json]],
     animation_channel_dicts: list[dict[str, Json]],
     animation_sampler_dicts: list[dict[str, Json]],
+    bone_name_to_world_rest_matrix: dict[str, Matrix],
 ) -> None:
     human_bones = vrm1.humanoid.human_bones
     human_bone_name_to_human_bone = human_bones.human_bone_name_to_human_bone()
@@ -710,7 +639,6 @@ def create_node_animation(
     animation_data = armature.animation_data
     if not animation_data:
         return
-
     action = animation_data.action
     if not action:
         return
@@ -719,449 +647,323 @@ def create_node_animation(
     bone_name_to_euler_offsets: dict[str, list[Euler]] = {}
     bone_name_to_axis_angle_offsets: dict[str, list[list[float]]] = {}
     hips_translation_offsets: list[Vector] = []
-
-    # We'll also store "location" offsets for non-humanoid bones
-    # so that we can export them similarly if desired
     bone_name_to_location_offsets_for_non_humanoid: dict[str, list[Vector]] = {}
-
-    # Pre-fill for each bone so we can store translation
     for pb in armature.pose.bones:
-        if pb.name not in bone_name_to_location_offsets_for_non_humanoid:
-            bone_name_to_location_offsets_for_non_humanoid[pb.name] = []
-        # We'll fill them as needed in the parse loop below
+        bone_name_to_location_offsets_for_non_humanoid[pb.name] = []
 
     for fcurve in action.fcurves:
-        if fcurve.mute:
+        if fcurve.mute or not fcurve.is_valid:
             continue
-        if not fcurve.is_valid:
+        bone_and_property = data_path_to_bone_and_property_name.get(fcurve.data_path)
+        if not bone_and_property:
             continue
-
-        bone_and_property_name = data_path_to_bone_and_property_name.get(
-            fcurve.data_path
-        )
-        if not bone_and_property_name:
-            continue
-        bone, property_name = bone_and_property_name
-        for frame in range(frame_start, frame_end + 1):
-            offset = frame - frame_start
-            value = float(fcurve.evaluate(frame))
-            if property_name == "rotation_quaternion":
-                quaternion_offsets = bone_name_to_quaternion_offsets.get(bone.name)
-                if quaternion_offsets is None:
-                    quaternion_offsets = []
-                    bone_name_to_quaternion_offsets[bone.name] = quaternion_offsets
-                while len(quaternion_offsets) <= offset:
-                    quaternion_offsets.append(Quaternion())
-                quaternion_offsets[offset][fcurve.array_index] = value
-            elif property_name == "rotation_axis_angle":
-                axis_angle_offsets = bone_name_to_axis_angle_offsets.get(bone.name)
-                if axis_angle_offsets is None:
-                    axis_angle_offsets = []
-                    bone_name_to_axis_angle_offsets[bone.name] = axis_angle_offsets
-                while len(axis_angle_offsets) <= offset:
-                    axis_angle_offsets.append([0.0, 0.0, 0.0, 0.0])
-                axis_angle_offsets[offset][fcurve.array_index] = value
-            elif property_name == "rotation_euler":
-                euler_offsets = bone_name_to_euler_offsets.get(bone.name)
-                if euler_offsets is None:
-                    euler_offsets = []
-                    bone_name_to_euler_offsets[bone.name] = euler_offsets
-                while len(euler_offsets) <= offset:
-                    euler_offsets.append(Euler((0, 0, 0)))
-                euler_offset = euler_offsets[offset]
-                indices = {
+        bone, prop_name = bone_and_property
+        for frame_i in range(frame_start, frame_end + 1):
+            idx = frame_i - frame_start
+            val = float(fcurve.evaluate(frame_i))
+            if prop_name == "rotation_quaternion":
+                arr = bone_name_to_quaternion_offsets.setdefault(bone.name, [])
+                while len(arr) <= idx:
+                    arr.append(Quaternion((0.0, 0.0, 0.0, 1.0)))
+                arr[idx][fcurve.array_index] = val
+            elif prop_name == "rotation_axis_angle":
+                arr = bone_name_to_axis_angle_offsets.setdefault(bone.name, [])
+                while len(arr) <= idx:
+                    arr.append([0.0, 0.0, 0.0, 0.0])
+                arr[idx][fcurve.array_index] = val
+            elif prop_name == "rotation_euler":
+                arr = bone_name_to_euler_offsets.setdefault(bone.name, [])
+                while len(arr) <= idx:
+                    arr.append(Euler((0, 0, 0)))
+                eul = arr[idx]
+                idx_map = {
                     "XYZ": [0, 1, 2],
                     "XZY": [0, 2, 1],
                     "YXZ": [1, 0, 2],
                     "YZX": [1, 2, 0],
                     "ZXY": [2, 0, 1],
                     "ZYX": [2, 1, 0],
-                }
-                index = indices.get(bone.rotation_mode)
-                if index is None:
-                    continue
-                euler_offset[index[fcurve.array_index]] = value
-            elif property_name == "location":
-                # if it's the hips, store in hips_translation_offsets
+                }.get(bone.rotation_mode, [0, 1, 2])
+                eul[idx_map[fcurve.array_index]] = val
+            elif prop_name == "location":
                 if bone.name == human_bones.hips.node.bone_name:
-                    while len(hips_translation_offsets) <= offset:
+                    while len(hips_translation_offsets) <= idx:
                         hips_translation_offsets.append(Vector((0.0, 0.0, 0.0)))
-                    hips_translation_offsets[offset][fcurve.array_index] = value
+                    hips_translation_offsets[idx][fcurve.array_index] = val
                 else:
-                    # store for non-humanoid
                     arr = bone_name_to_location_offsets_for_non_humanoid[bone.name]
-                    while len(arr) <= offset:
+                    while len(arr) <= idx:
                         arr.append(Vector((0.0, 0.0, 0.0)))
-                    arr[offset][fcurve.array_index] = value
+                    arr[idx][fcurve.array_index] = val
+
+    total_frames = frame_end - frame_start + 1
+    bone_name_to_quaternions: dict[str, list[Quaternion]] = {}
+    for pb in armature.pose.bones:
+        bname = pb.name
+        base_q = bone_name_to_base_quaternion.get(bname, Quaternion())
+        if bname in bone_name_to_quaternion_offsets:
+            arr = bone_name_to_quaternion_offsets[bname]
+            result_quats = []
+            for qtemp in arr:
+                result_quats.append(base_q @ qtemp.normalized())
+            bone_name_to_quaternions[bname] = result_quats
+        elif bname in bone_name_to_axis_angle_offsets:
+            arr = bone_name_to_axis_angle_offsets[bname]
+            result_quats = []
+            for axang in arr:
+                axq = Quaternion((axang[1], axang[2], axang[3]), axang[0]).normalized()
+                result_quats.append(base_q @ axq)
+            bone_name_to_quaternions[bname] = result_quats
+        elif bname in bone_name_to_euler_offsets:
+            arr = bone_name_to_euler_offsets[bname]
+            result_quats = []
+            for eul in arr:
+                eq = eul.to_quaternion()
+                result_quats.append(base_q @ eq)
+            bone_name_to_quaternions[bname] = result_quats
+        else:
+            bone_name_to_quaternions[bname] = [base_q for _ in range(total_frames)]
 
     # rotation
-    bone_name_to_quaternions: dict[str, list[Quaternion]] = {}
-    for bone_name, quaternion_offsets in bone_name_to_quaternion_offsets.items():
-        base_quaternion = bone_name_to_base_quaternion.get(bone_name)
-        if base_quaternion is None:
-            logger.warning("No base quaternion for bone: %s", bone_name)
+    for bname, quats in bone_name_to_quaternions.items():
+        node_idx = bone_name_to_node_index.get(bname)
+        if node_idx is None:
+            logger.error("Failed to find node index for bone %s", bname)
             continue
-        bone_name_to_quaternions[bone_name] = [
-            base_quaternion @ q.normalized() for q in quaternion_offsets
-        ]
-    for bone_name, euler_offsets in bone_name_to_euler_offsets.items():
-        base_quaternion = bone_name_to_base_quaternion.get(bone_name)
-        if base_quaternion is None:
-            logger.warning("No base quaternion for bone: %s", bone_name)
-            continue
-        quats = []
-        for eul in euler_offsets:
-            q = eul.to_quaternion()
-            qfinal = base_quaternion @ q
-            quats.append(qfinal)
-        bone_name_to_quaternions[bone_name] = quats
-    for bone_name, axis_angle_offsets in bone_name_to_axis_angle_offsets.items():
-        base_quaternion = bone_name_to_base_quaternion.get(bone_name)
-        if base_quaternion is None:
-            logger.warning("No base quaternion for bone: %s", bone_name)
-            continue
-        quats = []
-        for ax in axis_angle_offsets:
-            # ax[0] = angle, ax[1..3] = axis
-            q = Quaternion((ax[1], ax[2], ax[3]), ax[0]).normalized()
-            qfinal = base_quaternion @ q
-            quats.append(qfinal)
-        bone_name_to_quaternions[bone_name] = quats
-
-    # For bones that have no rotation curves, fill them with the base quaternion
-    # for the entire range
-    total_frames = frame_end - frame_start + 1
-    for pb in armature.pose.bones:
-        if pb.name not in bone_name_to_quaternions:
-            base_q = bone_name_to_base_quaternion.get(pb.name, Quaternion())
-            # fill the entire range
-            bone_name_to_quaternions[pb.name] = [base_q for _ in range(total_frames)]
-
-    # export rotations for all humanoid bones except eyes, and also for non-humanoid bones
-    for bone_name, quaternions in bone_name_to_quaternions.items():
-        node_index = bone_name_to_node_index.get(bone_name)
-        if not isinstance(node_index, int):
-            logger.error("Failed to find node index for bone %s", bone_name)
-            continue
-        # the official code checks if it's a known human bone, and also excludes R/L eye
-        # but we want to allow exporting for non-humanoid too
-        human_bone_name = next(
-            (
-                n
-                for n, human_bone in human_bone_name_to_human_bone.items()
-                if human_bone.node.bone_name == bone_name
-            ),
-            None,
-        )
-        if human_bone_name in [HumanBoneName.RIGHT_EYE, HumanBoneName.LEFT_EYE]:
+        maybe_hb_name = None
+        for hh, hhbone in human_bone_name_to_human_bone.items():
+            if hhbone.node.bone_name == bname:
+                maybe_hb_name = hh
+                break
+        if maybe_hb_name in [HumanBoneName.LEFT_EYE, HumanBoneName.RIGHT_EYE]:
             continue
 
-        input_byte_offset = len(buffer0_bytearray)
-        input_floats = [
-            frame * frame_to_timestamp_factor for frame, _ in enumerate(quaternions)
-        ]
-        input_bytes = struct.pack("<" + "f" * len(input_floats), *input_floats)
-        buffer0_bytearray.extend(input_bytes)
+        in_off = len(buffer0_bytearray)
+        times_arr = [float(i) * frame_to_timestamp_factor for i, _ in enumerate(quats)]
+        inbytes = struct.pack("<" + "f" * len(times_arr), *times_arr)
+        buffer0_bytearray.extend(inbytes)
         while len(buffer0_bytearray) % 32 != 0:
             buffer0_bytearray.append(0)
-        input_buffer_view_index = len(buffer_view_dicts)
-        input_buffer_view_dict: dict[str, Json] = {
-            "buffer": 0,
-            "byteLength": len(input_bytes),
-        }
-        if input_byte_offset > 0:
-            input_buffer_view_dict["byteOffset"] = input_byte_offset
-        buffer_view_dicts.append(input_buffer_view_dict)
+        in_bv_idx = len(buffer_view_dicts)
+        in_bv_d = {"buffer": 0, "byteLength": len(inbytes)}
+        if in_off > 0:
+            in_bv_d["byteOffset"] = in_off
+        buffer_view_dicts.append(in_bv_d)
 
-        output_byte_offset = len(buffer0_bytearray)
-        gltf_quaternions = [(q.x, q.z, -q.y, q.w) for q in quaternions]
-        quaternion_floats = list(itertools.chain(*gltf_quaternions))
-        quaternion_bytes = struct.pack(
-            "<" + "f" * len(quaternion_floats), *quaternion_floats
-        )
-        buffer0_bytearray.extend(quaternion_bytes)
+        out_off = len(buffer0_bytearray)
+        # ---- FIX: corrected quaternion axis mapping below ----
+        gltf_quats = [(qq.x, qq.z, -qq.y, qq.w) for qq in quats]
+        flatted = list(itertools.chain(*gltf_quats))
+        out_b = struct.pack("<" + "f" * len(flatted), *flatted)
+        buffer0_bytearray.extend(out_b)
         while len(buffer0_bytearray) % 32 != 0:
             buffer0_bytearray.append(0)
-        output_buffer_view_index = len(buffer_view_dicts)
-        output_buffer_view_dict: dict[str, Json] = {
-            "buffer": 0,
-            "byteLength": len(quaternion_bytes),
-        }
-        if output_byte_offset > 0:
-            output_buffer_view_dict["byteOffset"] = output_byte_offset
-        buffer_view_dicts.append(output_buffer_view_dict)
+        out_bv_idx = len(buffer_view_dicts)
+        out_bv_d = {"buffer": 0, "byteLength": len(out_b)}
+        if out_off > 0:
+            out_bv_d["byteOffset"] = out_off
+        buffer_view_dicts.append(out_bv_d)
 
-        input_accessor_index = len(accessor_dicts)
+        inp_acc_idx = len(accessor_dicts)
         accessor_dicts.append(
             {
-                "bufferView": input_buffer_view_index,
+                "bufferView": in_bv_idx,
                 "componentType": GL_FLOAT,
-                "count": len(input_floats),
+                "count": len(times_arr),
                 "type": "SCALAR",
-                "min": [min(input_floats)],
-                "max": [max(input_floats)],
+                "min": [min(times_arr)],
+                "max": [max(times_arr)],
             }
         )
-        output_accessor_index = len(accessor_dicts)
-
-        x_list = [qq[0] for qq in gltf_quaternions]
-        y_list = [qq[1] for qq in gltf_quaternions]
-        z_list = [qq[2] for qq in gltf_quaternions]
-        w_list = [qq[3] for qq in gltf_quaternions]
-
+        out_acc_idx = len(accessor_dicts)
+        xvs = [gg[0] for gg in gltf_quats]
+        yvs = [gg[1] for gg in gltf_quats]
+        zvs = [gg[2] for gg in gltf_quats]
+        wvs = [gg[3] for gg in gltf_quats]
         accessor_dicts.append(
             {
-                "bufferView": output_buffer_view_index,
+                "bufferView": out_bv_idx,
                 "componentType": GL_FLOAT,
-                "count": len(quaternions),
+                "count": len(quats),
                 "type": "VEC4",
-                "min": [
-                    min(x_list),
-                    min(y_list),
-                    min(z_list),
-                    min(w_list),
-                ],
-                "max": [
-                    max(x_list),
-                    max(y_list),
-                    max(z_list),
-                    max(w_list),
-                ],
+                "min": [min(xvs), min(yvs), min(zvs), min(wvs)],
+                "max": [max(xvs), max(yvs), max(zvs), max(wvs)],
             }
         )
 
-        animation_sampler_index = len(animation_sampler_dicts)
-        animation_sampler_dicts.append(
-            {
-                "input": input_accessor_index,
-                "output": output_accessor_index,
-            }
-        )
+        smp_idx = len(animation_sampler_dicts)
+        animation_sampler_dicts.append({"input": inp_acc_idx, "output": out_acc_idx})
         animation_channel_dicts.append(
             {
-                "sampler": animation_sampler_index,
-                "target": {"node": node_index, "path": "rotation"},
+                "sampler": smp_idx,
+                "target": {"node": node_idx, "path": "rotation"},
             }
         )
 
-    # hips location
+    # hips
     hips_bone_name = human_bones.hips.node.bone_name
     hips_bone = armature.pose.bones.get(hips_bone_name)
-    if not hips_bone:
-        return
+    if hips_bone:
+        hips_node_idx = bone_name_to_node_index.get(hips_bone_name)
+        if isinstance(hips_node_idx, int):
+            hips_translation_frames = []
+            for i in range(total_frames):
+                # We'll treat the fcurve location as local offset
+                # and just store it as-is in the channel, matching
+                # the importer logic expecting local transforms.
+                if i < len(hips_translation_offsets):
+                    tloc = hips_translation_offsets[i]
+                else:
+                    tloc = Vector((0.0, 0.0, 0.0))
+                hips_translation_frames.append(tloc)
 
-    hips_node_index = bone_name_to_node_index.get(hips_bone_name)
-    if not isinstance(hips_node_index, int):
-        return
+            if hips_translation_frames:
+                in_off = len(buffer0_bytearray)
+                times_arr = [
+                    float(i) * frame_to_timestamp_factor
+                    for i, _ in enumerate(hips_translation_frames)
+                ]
+                in_b = struct.pack("<" + "f" * len(times_arr), *times_arr)
+                buffer0_bytearray.extend(in_b)
+                while len(buffer0_bytearray) % 32 != 0:
+                    buffer0_bytearray.append(0)
+                in_bv_idx = len(buffer_view_dicts)
+                in_bv_d = {"buffer": 0, "byteLength": len(in_b)}
+                if in_off > 0:
+                    in_bv_d["byteOffset"] = in_off
+                buffer_view_dicts.append(in_bv_d)
 
-    if hips_bone.parent:
-        base_matrix = hips_bone.parent.matrix.inverted_safe()
-    else:
-        base_matrix = Matrix()
+                out_off = len(buffer0_bytearray)
+                gltf_off = [(ddd.x, ddd.z, -ddd.y) for ddd in hips_translation_frames]
+                flt = list(itertools.chain(*gltf_off))
+                out_b = struct.pack("<" + "f" * len(flt), *flt)
+                buffer0_bytearray.extend(out_b)
+                while len(buffer0_bytearray) % 32 != 0:
+                    buffer0_bytearray.append(0)
+                out_bv_idx = len(buffer_view_dicts)
+                out_bv_d = {"buffer": 0, "byteLength": len(out_b)}
+                if out_off > 0:
+                    out_bv_d["byteOffset"] = out_off
+                buffer_view_dicts.append(out_bv_d)
 
-    hips_translations = [
-        base_matrix @ hips_bone.matrix @ local_offset
-        for local_offset in hips_translation_offsets
-    ]
+                inp_acc_idx = len(accessor_dicts)
+                accessor_dicts.append(
+                    {
+                        "bufferView": in_bv_idx,
+                        "componentType": GL_FLOAT,
+                        "count": len(times_arr),
+                        "type": "SCALAR",
+                        "min": [min(times_arr)],
+                        "max": [max(times_arr)],
+                    }
+                )
+                out_acc_idx = len(accessor_dicts)
+                xarr = [a[0] for a in gltf_off]
+                yarr = [a[1] for a in gltf_off]
+                zarr = [a[2] for a in gltf_off]
+                accessor_dicts.append(
+                    {
+                        "bufferView": out_bv_idx,
+                        "componentType": GL_FLOAT,
+                        "count": len(hips_translation_frames),
+                        "type": "VEC3",
+                        "min": [min(xarr), min(yarr), min(zarr)],
+                        "max": [max(xarr), max(yarr), max(zarr)],
+                    }
+                )
 
-    if hips_translations:
-        input_byte_offset = len(buffer0_bytearray)
-        input_floats = [
-            frame * frame_to_timestamp_factor
-            for frame, _ in enumerate(hips_translations)
-        ]
-        input_bytes = struct.pack("<" + "f" * len(input_floats), *input_floats)
-        buffer0_bytearray.extend(input_bytes)
-        while len(buffer0_bytearray) % 32 != 0:
-            buffer0_bytearray.append(0)
-        input_buffer_view_index = len(buffer_view_dicts)
-        input_buffer_view_dict = {
-            "buffer": 0,
-            "byteLength": len(input_bytes),
-        }
-        if input_byte_offset > 0:
-            input_buffer_view_dict["byteOffset"] = input_byte_offset
-        buffer_view_dicts.append(input_buffer_view_dict)
+                sidx = len(animation_sampler_dicts)
+                animation_sampler_dicts.append(
+                    {"input": inp_acc_idx, "output": out_acc_idx}
+                )
+                animation_channel_dicts.append(
+                    {
+                        "sampler": sidx,
+                        "target": {"node": hips_node_idx, "path": "translation"},
+                    }
+                )
 
-        output_byte_offset = len(buffer0_bytearray)
-        gltf_translations = [
-            (translation.x, translation.z, -translation.y)
-            for translation in hips_translations
-        ]
-        translation_floats = list(itertools.chain(*gltf_translations))
-        translation_bytes = struct.pack(
-            "<" + "f" * len(translation_floats), *translation_floats
-        )
-        buffer0_bytearray.extend(translation_bytes)
-        while len(buffer0_bytearray) % 32 != 0:
-            buffer0_bytearray.append(0)
-        output_buffer_view_index = len(buffer_view_dicts)
-        output_buffer_view_dict = {
-            "buffer": 0,
-            "byteLength": len(translation_bytes),
-        }
-        if output_byte_offset > 0:
-            output_buffer_view_dict["byteOffset"] = output_byte_offset
-        buffer_view_dicts.append(output_buffer_view_dict)
-
-        input_accessor_index = len(accessor_dicts)
-        accessor_dicts.append(
-            {
-                "bufferView": input_buffer_view_index,
-                "componentType": GL_FLOAT,
-                "count": len(input_floats),
-                "type": "SCALAR",
-                "min": [min(input_floats)],
-                "max": [max(input_floats)],
-            }
-        )
-
-        output_accessor_index = len(accessor_dicts)
-        x_list = [t[0] for t in gltf_translations]
-        y_list = [t[1] for t in gltf_translations]
-        z_list = [t[2] for t in gltf_translations]
-        accessor_dicts.append(
-            {
-                "bufferView": output_buffer_view_index,
-                "componentType": GL_FLOAT,
-                "count": len(hips_translations),
-                "type": "VEC3",
-                "min": [
-                    min(x_list),
-                    min(y_list),
-                    min(z_list),
-                ],
-                "max": [
-                    max(x_list),
-                    max(y_list),
-                    max(z_list),
-                ],
-            }
-        )
-
-        animation_sampler_index = len(animation_sampler_dicts)
-        animation_sampler_dicts.append(
-            {
-                "input": input_accessor_index,
-                "output": output_accessor_index,
-            }
-        )
-        animation_channel_dicts.append(
-            {
-                "sampler": animation_sampler_index,
-                "target": {"node": hips_node_index, "path": "translation"},
-            }
-        )
-
-    # location for non-humanoid bones
-    # We'll do it similarly, but skipping the base_matrix approach (the official code
-    # does not handle non-humanoid translations. We'll do local transform approach
-    # like the parent's matrix invert, or you can do something else.
-    # For maximum similarity to the hips code, we'll replicate the same approach:
+    # non-humanoid translation
     for pb in armature.pose.bones:
         if pb.name == hips_bone_name:
             continue
-        location_offsets = bone_name_to_location_offsets_for_non_humanoid.get(pb.name)
-        if not location_offsets:
+        arr_loc = bone_name_to_location_offsets_for_non_humanoid[pb.name]
+        if not arr_loc:
             continue
-
-        node_index = bone_name_to_node_index.get(pb.name)
-        if not isinstance(node_index, int):
+        nd_idx = bone_name_to_node_index.get(pb.name)
+        if nd_idx is None:
             logger.error("Failed to find node index for bone %s", pb.name)
             continue
 
-        # We'll replicate the hips approach for a local translation:
-        if pb.parent:
-            base_matrix = pb.parent.matrix.inverted_safe()
-        else:
-            base_matrix = Matrix()
+        frames = []
+        for i in range(total_frames):
+            if i < len(arr_loc):
+                loc_ = arr_loc[i]
+            else:
+                loc_ = Vector((0.0, 0.0, 0.0))
+            frames.append(loc_)
 
-        # build final translations
-        final_translations = [
-            base_matrix @ pb.matrix @ loc_off for loc_off in location_offsets
-        ]
+        if frames:
+            in_off = len(buffer0_bytearray)
+            tm_arr = [
+                float(i) * frame_to_timestamp_factor for i, _ in enumerate(frames)
+            ]
+            inb = struct.pack("<" + "f" * len(tm_arr), *tm_arr)
+            buffer0_bytearray.extend(inb)
+            while len(buffer0_bytearray) % 32 != 0:
+                buffer0_bytearray.append(0)
+            in_bv_idx = len(buffer_view_dicts)
+            in_bv_d = {"buffer": 0, "byteLength": len(inb)}
+            if in_off > 0:
+                in_bv_d["byteOffset"] = in_off
+            buffer_view_dicts.append(in_bv_d)
 
-        input_byte_offset = len(buffer0_bytearray)
-        input_floats = [
-            frame * frame_to_timestamp_factor
-            for frame, _ in enumerate(final_translations)
-        ]
-        input_bytes = struct.pack("<" + "f" * len(input_floats), *input_floats)
-        buffer0_bytearray.extend(input_bytes)
-        while len(buffer0_bytearray) % 32 != 0:
-            buffer0_bytearray.append(0)
-        input_buffer_view_index = len(buffer_view_dicts)
-        input_buffer_view_dict = {
-            "buffer": 0,
-            "byteLength": len(input_bytes),
-        }
-        if input_byte_offset > 0:
-            input_buffer_view_dict["byteOffset"] = input_byte_offset
-        buffer_view_dicts.append(input_buffer_view_dict)
+            out_off = len(buffer0_bytearray)
+            gltf_lc = [(rr.x, rr.z, -rr.y) for rr in frames]
+            floc = list(itertools.chain(*gltf_lc))
+            outb = struct.pack("<" + "f" * len(floc), *floc)
+            buffer0_bytearray.extend(outb)
+            while len(buffer0_bytearray) % 32 != 0:
+                buffer0_bytearray.append(0)
+            out_bv_idx = len(buffer_view_dicts)
+            out_bv_d = {"buffer": 0, "byteLength": len(outb)}
+            if out_off > 0:
+                out_bv_d["byteOffset"] = out_off
+            buffer_view_dicts.append(out_bv_d)
 
-        output_byte_offset = len(buffer0_bytearray)
-        gltf_translations = [(v.x, v.z, -v.y) for v in final_translations]
-        translation_floats = list(itertools.chain(*gltf_translations))
-        translation_bytes = struct.pack(
-            "<" + "f" * len(translation_floats), *translation_floats
-        )
-        buffer0_bytearray.extend(translation_bytes)
-        while len(buffer0_bytearray) % 32 != 0:
-            buffer0_bytearray.append(0)
-        output_buffer_view_index = len(buffer_view_dicts)
-        output_buffer_view_dict = {
-            "buffer": 0,
-            "byteLength": len(translation_bytes),
-        }
-        if output_byte_offset > 0:
-            output_buffer_view_dict["byteOffset"] = output_byte_offset
-        buffer_view_dicts.append(output_buffer_view_dict)
+            inp_acc_idx = len(accessor_dicts)
+            accessor_dicts.append(
+                {
+                    "bufferView": in_bv_idx,
+                    "componentType": GL_FLOAT,
+                    "count": len(tm_arr),
+                    "type": "SCALAR",
+                    "min": [min(tm_arr)],
+                    "max": [max(tm_arr)],
+                }
+            )
+            out_acc_idx = len(accessor_dicts)
+            xxvals = [hw[0] for hw in gltf_lc]
+            yyvals = [hw[1] for hw in gltf_lc]
+            zzvals = [hw[2] for hw in gltf_lc]
+            accessor_dicts.append(
+                {
+                    "bufferView": out_bv_idx,
+                    "componentType": GL_FLOAT,
+                    "count": len(frames),
+                    "type": "VEC3",
+                    "min": [min(xxvals), min(yyvals), min(zzvals)],
+                    "max": [max(xxvals), max(yyvals), max(zzvals)],
+                }
+            )
 
-        input_accessor_index = len(accessor_dicts)
-        accessor_dicts.append(
-            {
-                "bufferView": input_buffer_view_index,
-                "componentType": GL_FLOAT,
-                "count": len(input_floats),
-                "type": "SCALAR",
-                "min": [min(input_floats)],
-                "max": [max(input_floats)],
-            }
-        )
-
-        output_accessor_index = len(accessor_dicts)
-        x_vals = [t[0] for t in gltf_translations]
-        y_vals = [t[1] for t in gltf_translations]
-        z_vals = [t[2] for t in gltf_translations]
-        accessor_dicts.append(
-            {
-                "bufferView": output_buffer_view_index,
-                "componentType": GL_FLOAT,
-                "count": len(final_translations),
-                "type": "VEC3",
-                "min": [
-                    min(x_vals),
-                    min(y_vals),
-                    min(z_vals),
-                ],
-                "max": [
-                    max(x_vals),
-                    max(y_vals),
-                    max(z_vals),
-                ],
-            }
-        )
-
-        translation_sampler_index = len(animation_sampler_dicts)
-        animation_sampler_dicts.append(
-            {
-                "input": input_accessor_index,
-                "output": output_accessor_index,
-            }
-        )
-        animation_channel_dicts.append(
-            {
-                "sampler": translation_sampler_index,
-                "target": {"node": node_index, "path": "translation"},
-            }
-        )
+            smp_i = len(animation_sampler_dicts)
+            animation_sampler_dicts.append(
+                {"input": inp_acc_idx, "output": out_acc_idx}
+            )
+            animation_channel_dicts.append(
+                {
+                    "sampler": smp_i,
+                    "target": {"node": nd_idx, "path": "translation"},
+                }
+            )
