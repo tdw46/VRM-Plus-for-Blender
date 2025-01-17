@@ -124,23 +124,27 @@ def create_node_dicts(
 
             # Add this offset to preserve the original spacing
             local_matrix.translation += offset
+
+        translation = local_matrix.to_translation()
+        rotation = local_matrix.to_quaternion()
+        scale = local_matrix.to_scale()
     else:
-        # Root bone local relative to the armature object's own world transform
-        local_matrix = armature_world_matrix.inverted_safe() @ bone_world_matrix
+        # For root bones:
+        # - Translation should be local (relative to rest position)
+        # - Rotation should be in world space
+        rest_matrix = armature_world_matrix @ bone.bone.matrix_local
+        local_translation = rest_matrix.inverted_safe() @ bone_world_matrix.translation
+        world_rotation = bone_world_matrix.to_quaternion()
 
-        # Invert the transfrom direction
-        local_matrix.translation *= -1
-    # -------------------------------------------------------
-
-    translation = local_matrix.to_translation()
-    rotation = local_matrix.to_quaternion()
+        translation = local_translation
+        rotation = world_rotation
+        scale = bone_world_matrix.to_scale()
 
     node_dict["translation"] = [
         translation.x,
         translation.z,
         -translation.y,
     ]
-    # ---- FIX: corrected quaternion axis mapping below ----
     node_dict["rotation"] = [
         rotation.x,
         rotation.z,
@@ -148,13 +152,12 @@ def create_node_dicts(
         rotation.w,
     ]
 
-    # We keep the existing scale logic if needed:
-    local_scale = local_matrix.to_scale()
-    if local_scale != Vector((1.0, 1.0, 1.0)):
+    # Handle scale
+    if scale != Vector((1.0, 1.0, 1.0)):
         node_dict["scale"] = [
-            local_scale.x,
-            local_scale.z,
-            local_scale.y,
+            scale.x,
+            scale.z,
+            scale.y,
         ]
 
     children = [
