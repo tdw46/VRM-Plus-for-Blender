@@ -58,11 +58,8 @@ class NodeRestPoseTree:
         translation_float3 = convert.float3_or_none(node_dict.get("translation"))
         if translation_float3:
             x, y, z = translation_float3
-            if node_index == hips_node_index:
-                translation = Vector((x, -z, y))
-            else:
-                # All other bones: x, y, z -> x, -z, y
-                translation = Vector((x, -z, y))
+            # Consolidated logic: treat hips the same as the others here
+            translation = Vector((x, -z, y))
         else:
             translation = Vector((0.0, 0.0, 0.0))
 

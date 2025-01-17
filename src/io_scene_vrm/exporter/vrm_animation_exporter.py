@@ -101,9 +101,35 @@ def create_node_dicts(
     if parent_bone:
         parent_world = armature_world_matrix @ parent_bone.matrix
         local_matrix = parent_world.inverted_safe() @ bone_world_matrix
+
+        # If this child bone is "disconnected" (use_connect=False),
+        # preserve its original offset from parent's tail
+        arm_data = parent_bone.id_data  # The Armature data block
+        if not arm_data.data.bones[bone.name].use_connect:
+            edit_parent = arm_data.data.bones[parent_bone.name]
+            edit_child = arm_data.data.bones[bone.name]
+
+            # The parent's tail is at (0, length, 0) in its own space
+            parent_tail = Vector((0.0, edit_parent.length, 0.0))
+
+            # Child's head position relative to parent's head in parent's space
+            child_head = edit_parent.matrix_local.inverted() @ edit_child.head_local
+
+            # The offset we need is the negative of what we had before
+            # This makes it relative to tail instead of being mirrored around the head
+            offset = -(child_head - parent_tail)
+
+            # Add parent_tail to shift the reference point from head to tail
+            offset -= parent_tail
+
+            # Add this offset to preserve the original spacing
+            local_matrix.translation += offset
     else:
         # Root bone local relative to the armature object's own world transform
         local_matrix = armature_world_matrix.inverted_safe() @ bone_world_matrix
+
+        # Invert the transfrom direction
+        local_matrix.translation *= -1
     # -------------------------------------------------------
 
     translation = local_matrix.to_translation()
